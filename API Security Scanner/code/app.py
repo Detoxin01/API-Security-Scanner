@@ -8,9 +8,15 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import asyncio
 import json
+import os
 from datetime import datetime
 from api_security_scanner import SecurityScanner, APIEndpoint
+from urllib.parse import urlparse
 import logging
+
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -23,6 +29,12 @@ logger = logging.getLogger(__name__)
 # Store scan history
 scan_history = []
 
+# Configuration
+MAX_ENDPOINTS = int(os.getenv('MAX_ENDPOINTS', '50'))
+MAX_TIMEOUT = int(os.getenv('MAX_TIMEOUT', '60'))
+MAX_CONCURRENT = int(os.getenv('MAX_CONCURRENT', '20'))
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', '').split(',') if os.getenv('ALLOWED_HOSTS') else []
+
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -34,11 +46,30 @@ def health_check():
     }), 200
 
 
+def validate_url(url):
+    """Validate URL format and check against allowed hosts"""
+    try:
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return False, "Invalid URL format"
+
+        if parsed.scheme not in ['http', 'https']:
+            return False, "Only HTTP and HTTPS protocols are allowed"
+
+        # Check against whitelist if configured
+        if ALLOWED_HOSTS and parsed.netloc not in ALLOWED_HOSTS:
+            return False, f"Host {parsed.netloc} is not in the allowed hosts list"
+
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
 @app.route('/api/scan', methods=['POST'])
 def start_scan():
     """
     Start a new security scan
-    
+
     Request body:
     {
         "base_url": "http://target-api.com",
@@ -47,7 +78,9 @@ def start_scan():
                 "method": "GET",
                 "path": "/api/users",
                 "requires_auth": true,
-                "parameters": {}
+                "parameters": {"query": {}, "json": {}},
+                "auth_token": "optional_token",
+                "allow_destructive": false
             }
         ],
         "timeout": 10,
@@ -56,60 +89,109 @@ def start_scan():
     """
     try:
         data = request.get_json()
-        
+
         # Validate required fields
-        if not data or 'base_url' not in data:
+        if not data:
+            return jsonify({'error': 'Request body is required'}), 400
+
+        if 'base_url' not in data:
             return jsonify({'error': 'Missing required field: base_url'}), 400
-        
-        if 'endpoints' not in data or not isinstance(data['endpoints'], list):
-            return jsonify({'error': 'Missing or invalid endpoints'}), 400
-        
+
+        if 'endpoints' not in data:
+            return jsonify({'error': 'Missing required field: endpoints'}), 400
+
+        if not isinstance(data['endpoints'], list):
+            return jsonify({'error': 'Field "endpoints" must be an array'}), 400
+
+        if len(data['endpoints']) == 0:
+            return jsonify({'error': 'At least one endpoint is required'}), 400
+
+        if len(data['endpoints']) > MAX_ENDPOINTS:
+            return jsonify({'error': f'Maximum {MAX_ENDPOINTS} endpoints allowed'}), 400
+
         base_url = data['base_url']
+
+        # Validate URL
+        is_valid, error_msg = validate_url(base_url)
+        if not is_valid:
+            return jsonify({'error': f'Invalid base_url: {error_msg}'}), 400
+
+        # Validate and bound timeout and concurrency
         timeout = data.get('timeout', 10)
         concurrent_requests = data.get('concurrent_requests', 5)
-        
-        # Convert endpoint dictionaries to APIEndpoint objects
+
+        if not isinstance(timeout, (int, float)) or timeout <= 0:
+            return jsonify({'error': 'timeout must be a positive number'}), 400
+
+        if not isinstance(concurrent_requests, int) or concurrent_requests <= 0:
+            return jsonify({'error': 'concurrent_requests must be a positive integer'}), 400
+
+        timeout = min(timeout, MAX_TIMEOUT)
+        concurrent_requests = min(concurrent_requests, MAX_CONCURRENT)
+
+        # Validate and convert endpoint dictionaries to APIEndpoint objects
         endpoints = []
-        for ep in data['endpoints']:
+        for i, ep in enumerate(data['endpoints']):
+            if not isinstance(ep, dict):
+                return jsonify({'error': f'Endpoint {i} must be an object'}), 400
+
+            if 'path' not in ep:
+                return jsonify({'error': f'Endpoint {i} missing required field: path'}), 400
+
+            method = ep.get('method', 'GET')
+            if method not in ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']:
+                return jsonify({'error': f'Endpoint {i} has invalid method: {method}'}), 400
+
             endpoint = APIEndpoint(
-                method=ep.get('method', 'GET'),
-                path=ep.get('path', '/'),
+                method=method,
+                path=ep.get('path'),
                 requires_auth=ep.get('requires_auth', False),
-                parameters=ep.get('parameters', {})
+                parameters=ep.get('parameters', {}),
+                auth_token=ep.get('auth_token'),
+                allow_destructive=ep.get('allow_destructive', False)
             )
             endpoints.append(endpoint)
-        
+
         logger.info(f"Starting scan for {base_url} with {len(endpoints)} endpoints")
-        
+
         # Create scanner and run scan
         scanner = SecurityScanner(
             base_url=base_url,
             timeout=timeout,
             concurrent_requests=concurrent_requests
         )
-        
+
         # Run async scan
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         result = loop.run_until_complete(scanner.scan(endpoints))
         loop.close()
-        
+
         result_dict = result.to_dict()
-        
+
+        # Check if scan had errors
+        if result.endpoints_failed > 0:
+            status_code = 207  # Multi-Status - partial success
+        else:
+            status_code = 200
+
         # Store in history
         scan_history.append({
             'timestamp': datetime.now().isoformat(),
             'result': result_dict
         })
-        
+
         return jsonify({
-            'status': 'success',
+            'status': 'success' if result.endpoints_failed == 0 else 'partial_success',
             'scan_id': len(scan_history),
             'data': result_dict
-        }), 200
-        
+        }), status_code
+
+    except ValueError as e:
+        logger.error(f"Validation error: {str(e)}")
+        return jsonify({'error': f'Validation error: {str(e)}'}), 400
     except Exception as e:
-        logger.error(f"Scan error: {str(e)}")
+        logger.error(f"Scan error: {str(e)}", exc_info=True)
         return jsonify({'error': f'Scan failed: {str(e)}'}), 500
 
 
@@ -247,8 +329,15 @@ def server_error(e):
 
 if __name__ == '__main__':
     logger.info("Starting API Security Scanner Web Server")
+    debug_mode = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+    host = os.getenv('FLASK_HOST', '127.0.0.1')
+    port = int(os.getenv('FLASK_PORT', '5000'))
+
+    if debug_mode:
+        logger.warning("⚠️  Running in DEBUG mode - not suitable for production!")
+
     app.run(
-        host='0.0.0.0',
-        port=5000,
-        debug=True
+        host=host,
+        port=port,
+        debug=debug_mode
     )
