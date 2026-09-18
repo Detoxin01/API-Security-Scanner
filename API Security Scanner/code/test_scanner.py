@@ -338,12 +338,12 @@ class TestConnectionFailures:
 
         result = await scanner.scan(endpoints)
 
-        # With unreachable host, tests may complete but with errors
-        # The key is that we get error reporting
+        # With unreachable host, all endpoints should fail
         assert result.endpoints_tested + result.endpoints_failed == len(endpoints)
-        # Note: Due to how aiohttp handles errors internally in tests,
-        # this may pass without errors if tests complete successfully
-        # In a real scenario with actual network errors, errors would be captured
+        # Should have errors or failed endpoints
+        assert result.endpoints_failed > 0 or len(result.errors) > 0
+        # Success rate should not be 100% for unreachable targets
+        assert result.success_rate < 100.0 or result.endpoints_failed > 0
 
     @pytest.mark.asyncio
     async def test_partial_failures(self):
@@ -477,6 +477,31 @@ class TestBoundedLimits:
         """Test that concurrent requests are capped"""
         scanner = SecurityScanner('http://localhost:3000', concurrent_requests=100)
         assert scanner.concurrent_requests <= 20
+
+
+class TestRedirectValidation:
+    """Test redirect validation with allowed_hosts"""
+
+    def test_scanner_with_allowed_hosts(self):
+        """Test scanner accepts allowed_hosts parameter"""
+        scanner = SecurityScanner('http://localhost:3000', allowed_hosts=['localhost', 'example.com'])
+        assert scanner.allowed_hosts == ['localhost', 'example.com']
+
+    def test_validate_redirect_host_allowed(self):
+        """Test that allowed hosts pass validation"""
+        scanner = SecurityScanner('http://localhost:3000', allowed_hosts=['localhost', 'example.com'])
+        assert scanner._validate_redirect_host('http://localhost/path') == True
+        assert scanner._validate_redirect_host('http://example.com/path') == True
+
+    def test_validate_redirect_host_blocked(self):
+        """Test that non-allowed hosts fail validation"""
+        scanner = SecurityScanner('http://localhost:3000', allowed_hosts=['localhost'])
+        assert scanner._validate_redirect_host('http://evil.com/path') == False
+
+    def test_validate_redirect_host_no_restrictions(self):
+        """Test that no allowed_hosts means no restrictions"""
+        scanner = SecurityScanner('http://localhost:3000')
+        assert scanner._validate_redirect_host('http://anything.com/path') == True
 
 
 if __name__ == '__main__':

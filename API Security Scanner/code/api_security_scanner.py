@@ -119,7 +119,7 @@ class SecurityScanner:
     """Main API Security Scanner"""
 
     def __init__(self, base_url: str, timeout: int = 10,
-                 concurrent_requests: int = 5):
+                 concurrent_requests: int = 5, allowed_hosts: Optional[List[str]] = None):
         """
         Initialize the security scanner
 
@@ -127,10 +127,12 @@ class SecurityScanner:
             base_url: Target API base URL
             timeout: Request timeout in seconds (max 60)
             concurrent_requests: Number of concurrent requests (max 20)
+            allowed_hosts: List of allowed hosts for redirects (optional)
         """
         self.base_url = base_url.rstrip('/')
         self.timeout = min(timeout, 60)  # Cap at 60 seconds
         self.concurrent_requests = min(concurrent_requests, 20)  # Cap at 20
+        self.allowed_hosts = allowed_hosts or []
         self.vulnerabilities: List[Vulnerability] = []
         self.endpoints_tested = 0
         self.endpoints_failed = 0
@@ -191,37 +193,86 @@ class SecurityScanner:
     async def _test_endpoint(self, session: aiohttp.ClientSession,
                             endpoint: APIEndpoint) -> bool:
         """Test a single endpoint for vulnerabilities. Returns True if successful, False if failed."""
+        url = f"{self.base_url}{endpoint.path}"
+
+        # Resolve path parameters
+        if endpoint.parameters and '{' in url:
+            for key, value in endpoint.parameters.items():
+                url = url.replace(f'{{{key}}}', str(value))
+
+        # Track if at least one test succeeded
+        any_test_succeeded = False
+
+        # Test 1: Authentication bypass
         try:
-            url = f"{self.base_url}{endpoint.path}"
-
-            # Resolve path parameters
-            if endpoint.parameters and '{' in url:
-                for key, value in endpoint.parameters.items():
-                    url = url.replace(f'{{{key}}}', str(value))
-
-            # Test 1: Authentication bypass
             await self._test_auth_bypass(session, url, endpoint)
-
-            # Test 2: SQL Injection (non-destructive only)
-            await self._test_sql_injection(session, url, endpoint)
-
-            # Test 3: Missing Rate Limiting
-            await self._test_rate_limiting(session, url, endpoint)
-
-            # Test 4: Broken Object Level Authorization
-            await self._test_object_level_auth(session, url, endpoint)
-
-            # Test 5: Security misconfiguration
-            await self._test_security_headers(session, url, endpoint)
-
-            logger.info(f"✓ Tested {endpoint.method} {endpoint.path}")
-            return True
-
+            any_test_succeeded = True
         except aiohttp.ClientError as e:
-            logger.error(f"Connection error testing {endpoint.method} {endpoint.path}: {str(e)}")
+            logger.error(f"Connection error in auth bypass test for {endpoint.method} {endpoint.path}: {str(e)}")
+            return False
+        except asyncio.TimeoutError as e:
+            logger.error(f"Timeout in auth bypass test for {endpoint.method} {endpoint.path}: {str(e)}")
             return False
         except Exception as e:
-            logger.error(f"Error testing {endpoint.method} {endpoint.path}: {str(e)}")
+            logger.debug(f"Auth bypass test skipped for {endpoint.method} {endpoint.path}: {str(e)}")
+
+        # Test 2: SQL Injection (non-destructive only)
+        try:
+            await self._test_sql_injection(session, url, endpoint)
+            any_test_succeeded = True
+        except aiohttp.ClientError as e:
+            logger.error(f"Connection error in SQL injection test for {endpoint.method} {endpoint.path}: {str(e)}")
+            return False
+        except asyncio.TimeoutError as e:
+            logger.error(f"Timeout in SQL injection test for {endpoint.method} {endpoint.path}: {str(e)}")
+            return False
+        except Exception as e:
+            logger.debug(f"SQL injection test skipped for {endpoint.method} {endpoint.path}: {str(e)}")
+
+        # Test 3: Missing Rate Limiting
+        try:
+            await self._test_rate_limiting(session, url, endpoint)
+            any_test_succeeded = True
+        except aiohttp.ClientError as e:
+            logger.error(f"Connection error in rate limiting test for {endpoint.method} {endpoint.path}: {str(e)}")
+            return False
+        except asyncio.TimeoutError as e:
+            logger.error(f"Timeout in rate limiting test for {endpoint.method} {endpoint.path}: {str(e)}")
+            return False
+        except Exception as e:
+            logger.debug(f"Rate limiting test skipped for {endpoint.method} {endpoint.path}: {str(e)}")
+
+        # Test 4: Broken Object Level Authorization
+        try:
+            await self._test_object_level_auth(session, url, endpoint)
+            any_test_succeeded = True
+        except aiohttp.ClientError as e:
+            logger.error(f"Connection error in object level auth test for {endpoint.method} {endpoint.path}: {str(e)}")
+            return False
+        except asyncio.TimeoutError as e:
+            logger.error(f"Timeout in object level auth test for {endpoint.method} {endpoint.path}: {str(e)}")
+            return False
+        except Exception as e:
+            logger.debug(f"Object level auth test skipped for {endpoint.method} {endpoint.path}: {str(e)}")
+
+        # Test 5: Security misconfiguration
+        try:
+            await self._test_security_headers(session, url, endpoint)
+            any_test_succeeded = True
+        except aiohttp.ClientError as e:
+            logger.error(f"Connection error in security headers test for {endpoint.method} {endpoint.path}: {str(e)}")
+            return False
+        except asyncio.TimeoutError as e:
+            logger.error(f"Timeout in security headers test for {endpoint.method} {endpoint.path}: {str(e)}")
+            return False
+        except Exception as e:
+            logger.debug(f"Security headers test skipped for {endpoint.method} {endpoint.path}: {str(e)}")
+
+        if any_test_succeeded:
+            logger.info(f"✓ Tested {endpoint.method} {endpoint.path}")
+            return True
+        else:
+            logger.error(f"✗ All tests failed for {endpoint.method} {endpoint.path}")
             return False
     
     async def _test_auth_bypass(self, session: aiohttp.ClientSession,
@@ -237,27 +288,30 @@ class SecurityScanner:
 
         # Test with empty credentials
         test_headers = {'Authorization': ''}
-        try:
-            # Send query params and JSON body if present
-            params = endpoint.parameters.get('query', {})
-            json_data = endpoint.parameters.get('json', None)
 
-            async with session.request(endpoint.method, url, headers=test_headers,
-                                      params=params, json=json_data) as resp:
-                if resp.status in [200, 201]:
-                    self.vulnerabilities.append(Vulnerability(
-                        type=VulnerabilityType.BROKEN_AUTH,
-                        severity=VulnerabilitySeverity.CRITICAL,
-                        endpoint=endpoint.path,
-                        method=endpoint.method,
-                        title="Authentication Bypass - Empty Bearer Token",
-                        description="API accepted empty authentication token",
-                        evidence=f"HTTP {resp.status} response with empty Authorization header",
-                        remediation="Implement proper authentication validation",
-                        cvss_score=9.8
-                    ))
-        except Exception as e:
-            logger.debug(f"Auth bypass test failed: {e}")
+        # Send query params and JSON body if present
+        params = endpoint.parameters.get('query', {})
+        json_data = endpoint.parameters.get('json', None)
+
+        # Use GET for destructive methods when allow_destructive is False
+        test_method = endpoint.method
+        if endpoint.method in ['POST', 'PUT', 'DELETE', 'PATCH'] and not endpoint.allow_destructive:
+            test_method = 'GET'
+
+        async with await self._safe_request(session, test_method, url, headers=test_headers,
+                                  params=params, json=json_data if test_method != 'GET' else None) as resp:
+            if resp.status in [200, 201]:
+                self.vulnerabilities.append(Vulnerability(
+                    type=VulnerabilityType.BROKEN_AUTH,
+                    severity=VulnerabilitySeverity.CRITICAL,
+                    endpoint=endpoint.path,
+                    method=endpoint.method,
+                    title="Authentication Bypass - Empty Bearer Token",
+                    description="API accepted empty authentication token",
+                    evidence=f"HTTP {resp.status} response with empty Authorization header",
+                    remediation="Implement proper authentication validation",
+                    cvss_score=9.8
+                ))
     
     async def _test_sql_injection(self, session: aiohttp.ClientSession,
                                  url: str, endpoint: APIEndpoint) -> None:
@@ -276,31 +330,28 @@ class SecurityScanner:
             return
 
         for payload in payloads:
-            try:
-                # Only test query parameters, not body
-                params = endpoint.parameters.get('query', {}).copy()
-                params.update({'id': payload, 'search': payload})
+            # Only test query parameters, not body
+            params = endpoint.parameters.get('query', {}).copy()
+            params.update({'id': payload, 'search': payload})
 
-                async with session.request(endpoint.method, url, params=params) as resp:
-                    content = await resp.text()
+            async with await self._safe_request(session, endpoint.method, url, params=params) as resp:
+                content = await resp.text()
 
-                    # Simple detection - look for SQL errors
-                    sql_indicators = ['SQL syntax', 'mysql_fetch', 'SQL error', 'ORA-', 'sqlite_', 'PostgreSQL']
-                    if any(indicator in content for indicator in sql_indicators):
-                        self.vulnerabilities.append(Vulnerability(
-                            type=VulnerabilityType.INJECTION,
-                            severity=VulnerabilitySeverity.CRITICAL,
-                            endpoint=endpoint.path,
-                            method=endpoint.method,
-                            title="SQL Injection Vulnerability",
-                            description="Endpoint vulnerable to SQL injection attacks",
-                            evidence=f"SQL error revealed with payload: {payload}",
-                            remediation="Use parameterized queries and prepared statements",
-                            cvss_score=9.9
-                        ))
-                        break
-            except Exception as e:
-                logger.debug(f"SQL injection test failed: {e}")
+                # Simple detection - look for SQL errors
+                sql_indicators = ['SQL syntax', 'mysql_fetch', 'SQL error', 'ORA-', 'sqlite_', 'PostgreSQL']
+                if any(indicator in content for indicator in sql_indicators):
+                    self.vulnerabilities.append(Vulnerability(
+                        type=VulnerabilityType.INJECTION,
+                        severity=VulnerabilitySeverity.CRITICAL,
+                        endpoint=endpoint.path,
+                        method=endpoint.method,
+                        title="SQL Injection Vulnerability",
+                        description="Endpoint vulnerable to SQL injection attacks",
+                        evidence=f"SQL error revealed with payload: {payload}",
+                        remediation="Use parameterized queries and prepared statements",
+                        cvss_score=9.9
+                    ))
+                    break
     
     async def _test_rate_limiting(self, session: aiohttp.ClientSession,
                                  url: str, endpoint: APIEndpoint) -> None:
@@ -312,35 +363,37 @@ class SecurityScanner:
 
         # Send multiple requests rapidly
         responses = []
-        try:
-            params = endpoint.parameters.get('query', {})
-            for i in range(20):  # Increased to 20 to be more thorough
-                async with session.request(endpoint.method, url, params=params) as resp:
-                    responses.append(resp.status)
+        params = endpoint.parameters.get('query', {})
+        headers = {}
+        if endpoint.auth_token:
+            headers['Authorization'] = f'Bearer {endpoint.auth_token}'
 
-            # Check if we got rate limited (429 = rate limited, which is good)
-            # Only report if all requests succeeded with 2xx status
-            successful_responses = [s for s in responses if 200 <= s < 300]
-            if len(successful_responses) >= 15 and 429 not in responses:
-                self.vulnerabilities.append(Vulnerability(
-                    type=VulnerabilityType.RATE_LIMITING,
-                    severity=VulnerabilitySeverity.MEDIUM,
-                    endpoint=endpoint.path,
-                    method=endpoint.method,
-                    title="Potential Missing Rate Limiting",
-                    description="API may not implement rate limiting",
-                    evidence=f"Sent 20 consecutive requests, {len(successful_responses)} succeeded without 429 response",
-                    remediation="Implement rate limiting using token bucket or similar algorithm",
-                    cvss_score=5.3
-                ))
-        except Exception as e:
-            logger.debug(f"Rate limiting test failed: {e}")
+        for i in range(20):  # Increased to 20 to be more thorough
+            async with await self._safe_request(session, endpoint.method, url, params=params, headers=headers) as resp:
+                responses.append(resp.status)
+
+        # Check if we got rate limited (429 = rate limited, which is good)
+        # Only report if all requests succeeded with 2xx status
+        successful_responses = [s for s in responses if 200 <= s < 300]
+        if len(successful_responses) >= 15 and 429 not in responses:
+            self.vulnerabilities.append(Vulnerability(
+                type=VulnerabilityType.RATE_LIMITING,
+                severity=VulnerabilitySeverity.MEDIUM,
+                endpoint=endpoint.path,
+                method=endpoint.method,
+                title="Potential Missing Rate Limiting",
+                description="API may not implement rate limiting",
+                evidence=f"Sent 20 consecutive requests, {len(successful_responses)} succeeded without 429 response",
+                remediation="Implement rate limiting using token bucket or similar algorithm",
+                cvss_score=5.3
+            ))
     
     async def _test_object_level_auth(self, session: aiohttp.ClientSession,
                                      url: str, endpoint: APIEndpoint) -> None:
         """Test for broken object-level authorization"""
-        # Only test if authentication is required and endpoint has ID parameters
-        if not endpoint.requires_auth or ('{id}' not in url and '{' not in url):
+        # Check if endpoint.path (not url) has ID parameters
+        # This needs to be checked BEFORE path replacement
+        if not endpoint.requires_auth or ('{id}' not in endpoint.path and '{' not in endpoint.path):
             logger.debug(f"Skipping BOLA test for {endpoint.path} (no auth or no ID parameter)")
             return
 
@@ -349,28 +402,29 @@ class SecurityScanner:
         successful_accesses = []
 
         for test_id in test_ids:
-            try:
-                test_url = url
-                if '{id}' in url:
-                    test_url = url.replace('{id}', test_id)
-                elif '{' in url:
-                    # Replace any path parameter
-                    import re
-                    test_url = re.sub(r'\{[^}]+\}', test_id, url, count=1)
-                else:
-                    test_url = url + f"/{test_id}"
+            test_url = url
+            if '{id}' in test_url:
+                test_url = test_url.replace('{id}', test_id)
+            elif '{' in test_url:
+                # Replace any path parameter
+                import re
+                test_url = re.sub(r'\{[^}]+\}', test_id, url, count=1)
+            else:
+                test_url = url + f"/{test_id}"
 
-                # Test WITHOUT authentication header (should fail if properly secured)
-                params = endpoint.parameters.get('query', {})
-                async with session.request(endpoint.method, test_url, params=params) as resp:
-                    if resp.status == 200:
-                        content = await resp.text()
-                        # Only flag if we got actual data (not empty or error message)
-                        if content and len(content) > 50 and not any(err in content.lower() for err in ['error', 'unauthorized', 'forbidden', 'not found']):
-                            successful_accesses.append(test_id)
+            # Use GET for destructive methods when allow_destructive is False
+            test_method = endpoint.method
+            if endpoint.method in ['POST', 'PUT', 'DELETE', 'PATCH'] and not endpoint.allow_destructive:
+                test_method = 'GET'
 
-            except Exception as e:
-                logger.debug(f"Object level auth test failed: {e}")
+            # Test WITHOUT authentication header (should fail if properly secured)
+            params = endpoint.parameters.get('query', {})
+            async with await self._safe_request(session, test_method, test_url, params=params) as resp:
+                if resp.status == 200:
+                    content = await resp.text()
+                    # Only flag if we got actual data (not empty or error message)
+                    if content and len(content) > 50 and not any(err in content.lower() for err in ['error', 'unauthorized', 'forbidden', 'not found']):
+                        successful_accesses.append(test_id)
 
         # Only report if we successfully accessed multiple different IDs without auth
         if len(successful_accesses) >= 2:
@@ -396,41 +450,72 @@ class SecurityScanner:
             'Content-Security-Policy': 'default-src'
         }
 
-        try:
-            params = endpoint.parameters.get('query', {})
-            json_data = endpoint.parameters.get('json', None)
-            headers = {}
-            if endpoint.auth_token:
-                headers['Authorization'] = f'Bearer {endpoint.auth_token}'
+        params = endpoint.parameters.get('query', {})
+        json_data = endpoint.parameters.get('json', None)
+        headers = {}
+        if endpoint.auth_token:
+            headers['Authorization'] = f'Bearer {endpoint.auth_token}'
 
-            async with session.request(endpoint.method, url, params=params,
-                                      json=json_data, headers=headers) as resp:
-                missing_headers = []
-                for header, expected_value in required_headers.items():
-                    if header not in resp.headers:
-                        missing_headers.append(header)
+        # Use GET for destructive methods when allow_destructive is False
+        test_method = endpoint.method
+        if endpoint.method in ['POST', 'PUT', 'DELETE', 'PATCH'] and not endpoint.allow_destructive:
+            test_method = 'GET'
 
-                # Only report if multiple critical headers are missing
-                if len(missing_headers) >= 2:
-                    self.vulnerabilities.append(Vulnerability(
-                        type=VulnerabilityType.SECURITY_MISCONFIGURATION,
-                        severity=VulnerabilitySeverity.LOW,
-                        endpoint=endpoint.path,
-                        method=endpoint.method,
-                        title="Missing Security Headers",
-                        description=f"Missing {len(missing_headers)} security headers",
-                        evidence=f"Headers not found: {', '.join(missing_headers)}",
-                        remediation="Add security headers to all API responses",
-                        cvss_score=3.7
-                    ))
-        except Exception as e:
-            logger.debug(f"Security headers test failed: {e}")
+        async with await self._safe_request(session, test_method, url, params=params,
+                                  json=json_data if test_method != 'GET' else None, headers=headers) as resp:
+            missing_headers = []
+            for header, expected_value in required_headers.items():
+                if header not in resp.headers:
+                    missing_headers.append(header)
+
+            # Only report if multiple critical headers are missing
+            if len(missing_headers) >= 2:
+                self.vulnerabilities.append(Vulnerability(
+                    type=VulnerabilityType.SECURITY_MISCONFIGURATION,
+                    severity=VulnerabilitySeverity.LOW,
+                    endpoint=endpoint.path,
+                    method=endpoint.method,
+                    title="Missing Security Headers",
+                    description=f"Missing {len(missing_headers)} security headers",
+                    evidence=f"Headers not found: {', '.join(missing_headers)}",
+                    remediation="Add security headers to all API responses",
+                    cvss_score=3.7
+                ))
     
     def _calculate_success_rate(self, endpoints: List[APIEndpoint]) -> float:
         """Calculate successful endpoint tests"""
         if not endpoints:
             return 0.0
         return (self.endpoints_tested / len(endpoints)) * 100
+
+    def _validate_redirect_host(self, url: str) -> bool:
+        """Validate that a redirect destination is in allowed hosts"""
+        if not self.allowed_hosts:
+            return True  # No restrictions if allowed_hosts not set
+
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        return parsed.netloc in self.allowed_hosts
+
+    async def _safe_request(self, session: aiohttp.ClientSession, method: str, url: str,
+                           **kwargs) -> aiohttp.ClientResponse:
+        """Make a request and validate redirects if allowed_hosts is configured"""
+        if not self.allowed_hosts:
+            # No validation needed
+            return await session.request(method, url, **kwargs)
+
+        # Disable redirects and handle manually
+        kwargs['allow_redirects'] = False
+        resp = await session.request(method, url, **kwargs)
+
+        # Check if it's a redirect
+        if resp.status in (301, 302, 303, 307, 308):
+            redirect_url = resp.headers.get('Location', '')
+            if redirect_url:
+                if not self._validate_redirect_host(redirect_url):
+                    raise ValueError(f"Redirect to unauthorized host: {redirect_url}")
+
+        return resp
 
 
 async def main():

@@ -88,14 +88,21 @@ def start_scan():
     }
     """
     try:
-        data = request.get_json()
+        # Try to parse JSON with error handling
+        try:
+            data = request.get_json(force=True)
+        except Exception as json_error:
+            return jsonify({'error': f'Invalid JSON: {str(json_error)}'}), 400
 
         # Validate required fields
-        if not data:
+        if not data or not isinstance(data, dict):
             return jsonify({'error': 'Request body is required'}), 400
 
         if 'base_url' not in data:
             return jsonify({'error': 'Missing required field: base_url'}), 400
+
+        if not isinstance(data['base_url'], str) or not data['base_url'].strip():
+            return jsonify({'error': 'base_url must be a non-empty string'}), 400
 
         if 'endpoints' not in data:
             return jsonify({'error': 'Missing required field: endpoints'}), 400
@@ -138,9 +145,37 @@ def start_scan():
             if 'path' not in ep:
                 return jsonify({'error': f'Endpoint {i} missing required field: path'}), 400
 
+            if not isinstance(ep['path'], str) or not ep['path'].strip():
+                return jsonify({'error': f'Endpoint {i} path must be a non-empty string'}), 400
+
+            # Validate path starts with /
+            if not ep['path'].startswith('/'):
+                return jsonify({'error': f'Endpoint {i} path must start with /'}), 400
+
             method = ep.get('method', 'GET')
+            if not isinstance(method, str):
+                return jsonify({'error': f'Endpoint {i} method must be a string'}), 400
             if method not in ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']:
                 return jsonify({'error': f'Endpoint {i} has invalid method: {method}'}), 400
+
+            # Validate parameters if provided
+            parameters = ep.get('parameters', {})
+            if not isinstance(parameters, dict):
+                return jsonify({'error': f'Endpoint {i} parameters must be an object'}), 400
+
+            # Validate auth_token if provided
+            auth_token = ep.get('auth_token')
+            if auth_token is not None and not isinstance(auth_token, str):
+                return jsonify({'error': f'Endpoint {i} auth_token must be a string'}), 400
+
+            # Validate boolean fields
+            requires_auth = ep.get('requires_auth', False)
+            if not isinstance(requires_auth, bool):
+                return jsonify({'error': f'Endpoint {i} requires_auth must be a boolean'}), 400
+
+            allow_destructive = ep.get('allow_destructive', False)
+            if not isinstance(allow_destructive, bool):
+                return jsonify({'error': f'Endpoint {i} allow_destructive must be a boolean'}), 400
 
             endpoint = APIEndpoint(
                 method=method,
@@ -158,7 +193,8 @@ def start_scan():
         scanner = SecurityScanner(
             base_url=base_url,
             timeout=timeout,
-            concurrent_requests=concurrent_requests
+            concurrent_requests=concurrent_requests,
+            allowed_hosts=ALLOWED_HOSTS if ALLOWED_HOSTS else None
         )
 
         # Run async scan
